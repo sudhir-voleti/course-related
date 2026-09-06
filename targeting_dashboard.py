@@ -23,7 +23,8 @@ scored_df = None
 
 # --- WIDGETS ---
 upload_widget = widgets.FileUpload(accept='.csv', multiple=False, description='Upload CSV')
-y_dropdown = widgets.Dropdown(description='Target (Y):', options=[], layout=widgets.Layout(width='50%'))
+y_dropdown = widgets.Dropdown(description='Target Column:', options=[], layout=widgets.Layout(width='50%'))
+target_value_dropdown = widgets.Dropdown(description='Target Value (1):', options=[], layout=widgets.Layout(width='50%'))
 x_selector = widgets.SelectMultiple(description='Predictors (X):', options=[], layout=widgets.Layout(width='50%', height='150px'))
 run_button = widgets.Button(description='Run Targeting Model', button_style='success', layout=widgets.Layout(width='200px'))
 threshold_slider = widgets.FloatSlider(value=0.5, min=0.1, max=0.9, step=0.05, description='Threshold:', readout_format='.0%')
@@ -36,7 +37,7 @@ output_scoring = widgets.Output()
 
 tabs = widgets.Tab(children=[
     widgets.VBox([widgets.HTML('<h3>Step 1: Upload your discriminant data</h3>'), upload_widget, output_upload]),
-    widgets.VBox([widgets.HTML('<h3>Step 2: Select Target Segment and Observables</h3>'), y_dropdown, x_selector, run_button, output_results]),
+    widgets.VBox([widgets.HTML('<h3>Step 2: Select Target Segment and Observables</h3>'), y_dropdown, target_value_dropdown, x_selector, run_button, output_results]),
     widgets.VBox([widgets.HTML('<h3>Step 3: Model Accuracy</h3>'), output_accuracy]),
     widgets.VBox([widgets.HTML('<h3>Step 4: Score & Rank Prospects</h3>'), threshold_slider, download_button, output_scoring])
 ])
@@ -67,8 +68,28 @@ def on_upload(change):
         if len(cols) > 1:
             y_dropdown.value = cols[0]
             x_selector.value = tuple(c for c in cols if c != cols[0])
+        update_target_value_options(None)
 
 upload_widget.observe(on_upload, names='value')
+
+def update_target_value_options(change):
+    """Populate target value dropdown based on Y column's unique values."""
+    if df is None or not y_dropdown.value:
+        return
+    y_col = y_dropdown.value
+    unique_vals = df[y_col].dropna().unique().tolist()
+    
+    # If already binary numeric, hide the dropdown; else show it
+    if len(unique_vals) == 2 and all(isinstance(v, (int, float, np.integer, np.floating)) for v in unique_vals):
+        target_value_dropdown.options = ['(auto — binary numeric)']
+        target_value_dropdown.value = '(auto — binary numeric)'
+        target_value_dropdown.disabled = True
+    else:
+        target_value_dropdown.options = [str(v) for v in unique_vals]
+        target_value_dropdown.value = str(unique_vals[0])
+        target_value_dropdown.disabled = False
+
+y_dropdown.observe(update_target_value_options, names='value')
 
 def run_model(b):
     global model_results, scored_df
@@ -96,11 +117,32 @@ def run_model(b):
     
     # Prep data
     dff = df[[y_col] + x_cols].dropna()
-    y = dff[y_col].astype(int)
+    
+    # Build binary Y
+    if target_value_dropdown.disabled or target_value_dropdown.value == '(auto — binary numeric)':
+        # Already numeric
+        y = dff[y_col].astype(int)
+    else:
+        # Categorical: 1 = selected target value, 0 = everything else
+        target_val = target_value_dropdown.value
+        # Try to match original dtype
+        if dff[y_col].dtype != 'object':
+            try:
+                target_val = type(dff[y_col].iloc[0])(target_val)
+            except:
+                pass
+        y = (dff[y_col] == target_val).astype(int)
     
     # Handle categorical X
     X = pd.get_dummies(dff[x_cols], drop_first=True)
     X = sm.add_constant(X)
+    
+    # Check for constant Y
+    if y.nunique() < 2:
+        with output_results:
+            clear_output()
+            print("Target variable has only one class after filtering. Cannot train model.")
+        return
     
     # Train/test split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
@@ -124,6 +166,8 @@ def run_model(b):
     # --- TAB 2: PREDICTORS ---
     with output_results:
         clear_output()
+        
+        display(HTML(f'<p><b>Target:</b> {y_col} = "{target_value_dropdown.value}" → 1, all others → 0 | <b>N in segment:</b> {y.sum()} | <b>N not in segment:</b> {len(y)-y.sum()}</p>'))
         
         # Summary table
         summ = pd.DataFrame({
