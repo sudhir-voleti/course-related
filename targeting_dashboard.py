@@ -176,11 +176,10 @@ def _build_design(dframe, x_cols, nonmetric_cols):
     return X.astype(float)
 
 def _fit_logit_sklearn(X_train, y_train):
-    """Fit with sklearn — robust to multicollinearity via weak L2 regularization."""
-    # C=1e10 ≈ unregularized, but numerically stable
+    """Fit with sklearn — moderate L2 regularization for stable coefficients."""
     model = LogisticRegression(
         penalty='l2',
-        C=1e10,
+        C=1.0,  # moderate regularization
         solver='lbfgs',
         max_iter=1000,
         random_state=42
