@@ -1,7 +1,8 @@
 # ============================================================
 # TARGETING DASHBOARD — Lec05 MKTG
-# sklearn backend — robust to singular matrices
+# sklearn backend — robust, sortable tables, prediction upload
 # ============================================================
+
 import pandas as pd
 import numpy as np
 import io
@@ -9,11 +10,9 @@ import base64
 from IPython.display import display, HTML, clear_output
 import ipywidgets as widgets
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import train_test_split
 from scipy import stats
-
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -24,12 +23,13 @@ except ImportError:
     import subprocess, sys
     subprocess.check_call([sys.executable, "-m", "pip", "install", "itables==2.2.5", "-q"])
     from itables import show
-    
+
 # --- GLOBALS ---
 df = None
 model_obj = None
 feature_names = None
 scored_df = None
+predict_df = None
 
 # --- WIDGETS ---
 upload_widget = widgets.FileUpload(accept='.csv', multiple=False, description='Upload CSV')
@@ -46,11 +46,15 @@ run_button = widgets.Button(description='Run Targeting Model', button_style='suc
 threshold_slider = widgets.FloatSlider(value=0.5, min=0.1, max=0.9, step=0.05, description='Threshold:', readout_format='.0%')
 download_button = widgets.Button(description='Download Scored CSV', button_style='primary', layout=widgets.Layout(width='200px'))
 
+predict_upload_widget = widgets.FileUpload(accept='.csv', multiple=False, description='Upload New Prospects CSV')
+score_new_button = widgets.Button(description='Score New Prospects', button_style='warning', layout=widgets.Layout(width='200px'))
+
 output_upload = widgets.Output()
 output_varselect = widgets.Output()
 output_results = widgets.Output()
 output_accuracy = widgets.Output()
 output_scoring = widgets.Output()
+output_predict = widgets.Output()
 
 tabs = widgets.Tab(children=[
     widgets.VBox([widgets.HTML('<h3>Step 1: Upload Data</h3>'), upload_widget, output_upload]),
@@ -62,7 +66,14 @@ tabs = widgets.Tab(children=[
     ]),
     widgets.VBox([widgets.HTML('<h3>Step 3: Predictor Results</h3>'), run_button, output_results]),
     widgets.VBox([widgets.HTML('<h3>Step 4: Model Accuracy</h3>'), output_accuracy]),
-    widgets.VBox([widgets.HTML('<h3>Step 5: Score & Rank Prospects</h3>'), threshold_slider, download_button, output_scoring])
+    widgets.VBox([
+        widgets.HTML('<h3>Step 5: Score & Rank Prospects</h3>'),
+        widgets.HTML('<p><b>Option A:</b> Rank rows from the training data.</p>'),
+        threshold_slider, download_button, output_scoring,
+        widgets.HTML('<hr style="margin:18px 0; border:0; border-top:1px solid #ccc;">'),
+        widgets.HTML('<p><b>Option B:</b> Upload a <i>new</i> CSV of prospects (no target column needed). The trained model scores each row.</p>'),
+        predict_upload_widget, score_new_button, output_predict
+    ])
 ])
 tabs.set_title(0, 'Upload')
 tabs.set_title(1, 'Select Variables')
@@ -94,7 +105,6 @@ def on_upload(change):
             y_dropdown.value = cols[0]
             x_selector.value = tuple(c for c in cols if c != cols[0])
         
-        # KEY FIX: Categorical defaults to NONE selected
         nonmetric_selector.value = ()
         
         update_target_value_options(None)
@@ -154,32 +164,26 @@ def confirm_selections(b):
 confirm_vars_button.on_click(confirm_selections)
 
 def _build_design(dframe, x_cols, nonmetric_cols):
-    """Return design matrix X (no constant) and feature name list."""
     X_parts = []
     cont_cols = [c for c in x_cols if c not in nonmetric_cols]
-    
     if cont_cols:
         X_cont = dframe[cont_cols].copy()
         for c in cont_cols:
             X_cont[c] = pd.to_numeric(X_cont[c], errors='coerce')
         X_parts.append(X_cont)
-    
     cat_cols = [c for c in x_cols if c in nonmetric_cols]
     if cat_cols:
         X_cat = pd.get_dummies(dframe[cat_cols], drop_first=True)
         X_parts.append(X_cat)
-    
     if not X_parts:
         raise ValueError("No valid predictors.")
-    
     X = pd.concat(X_parts, axis=1)
     return X.astype(float)
 
 def _fit_logit_sklearn(X_train, y_train):
-    """Fit with sklearn — moderate L2 regularization for stable coefficients."""
     model = LogisticRegression(
         penalty='l2',
-        C=1.0,  # moderate regularization
+        C=1.0,
         solver='lbfgs',
         max_iter=1000,
         random_state=42
@@ -188,7 +192,6 @@ def _fit_logit_sklearn(X_train, y_train):
     return model
 
 def _bootstrap_pvalues(model, X, y, n_boot=100):
-    """Bootstrap p-values: check if coefficient is stable across resamples."""
     coef_samples = []
     rng = np.random.RandomState(42)
     for i in range(n_boot):
@@ -211,7 +214,28 @@ def _bootstrap_pvalues(model, X, y, n_boot=100):
         p = max(2 * min(opposite, 1 - opposite), 0.001) if opposite > 0 else 0.001
         pvals.append(p)
     return np.array(pvals), np.std(coef_samples, axis=0)
-    
+
+def _prepare_prediction(dframe, x_cols, nonmetric_cols, expected_cols):
+    X_parts = []
+    cont_cols = [c for c in x_cols if c not in nonmetric_cols]
+    if cont_cols:
+        X_cont = dframe[cont_cols].copy()
+        for c in cont_cols:
+            X_cont[c] = pd.to_numeric(X_cont[c], errors='coerce')
+        X_parts.append(X_cont)
+    cat_cols = [c for c in x_cols if c in nonmetric_cols]
+    if cat_cols:
+        X_cat = pd.get_dummies(dframe[cat_cols], drop_first=True)
+        X_parts.append(X_cat)
+    if not X_parts:
+        raise ValueError("No valid predictors in new data.")
+    X = pd.concat(X_parts, axis=1).astype(float)
+    for col in expected_cols:
+        if col not in X.columns:
+            X[col] = 0.0
+    X = X[expected_cols]
+    return X
+
 def run_model(b):
     global model_obj, feature_names, scored_df
     
@@ -231,7 +255,6 @@ def run_model(b):
             print("Select variables first.")
         return
     
-    # Build Y
     dff = df[[y_col] + x_cols].dropna()
     
     if target_value_dropdown.disabled or target_value_dropdown.value == '(auto — already 0/1)':
@@ -251,7 +274,6 @@ def run_model(b):
             print("Target has only one class. Cannot train.")
         return
     
-    # Build X
     try:
         X = _build_design(dff, x_cols, nonmetric_cols)
     except Exception as e:
@@ -262,20 +284,15 @@ def run_model(b):
     
     feature_names = list(X.columns)
     
-    # Train/test split
     try:
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     except ValueError:
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # Fit model (sklearn — never crashes on singular matrix)
     model_obj = _fit_logit_sklearn(X_train, y_train)
-    
-    # Predictions
     y_pred_prob = model_obj.predict_proba(X_test)[:, 1]
     y_pred = model_obj.predict(X_test)
     
-    # P-values via bootstrap (robust to separation)
     p_values, std_errors = _bootstrap_pvalues(model_obj, X_train, y_train)
     
     # --- TAB 3: PREDICTORS ---
@@ -312,8 +329,8 @@ def run_model(b):
             ax.set_title('Strongest Predictors')
             plt.tight_layout()
             plt.show()
-
-        # --- TAB 4: ACCURACY ---
+    
+    # --- TAB 4: ACCURACY ---
     with output_accuracy:
         clear_output()
         display(HTML('<h4>Model Accuracy</h4>'))
@@ -321,15 +338,12 @@ def run_model(b):
         train_acc = model_obj.score(X_train, y_train) * 100
         test_acc = model_obj.score(X_test, y_test) * 100
         
-        # Separation warning
         if train_acc > 95:
             display(HTML("""
             <div style="background:#fff3cd; border:1px solid #ffc107; padding:12px; border-radius:6px; margin-bottom:12px;">
-                <b>⚠️ Warning: Near-perfect accuracy detected.</b><br>
-                One or more predictors may almost perfectly predict the target segment 
-                (e.g., "Occupation = Student" perfectly identifies "Not Busy Professional"). 
-                This is not a "good" model — it is a tautology. Remove the strongest predictor 
-                and re-run to find meaningful patterns.
+                <b>Warning: Near-perfect accuracy detected.</b><br>
+                One or more predictors may almost perfectly predict the target.
+                Remove the strongest predictor and re-run to find meaningful patterns.
             </div>
             """))
         
@@ -356,7 +370,6 @@ def run_model(b):
                              columns=['Predicted Not Target', 'Predicted Target'])
         display(HTML('<p><b>Confusion Matrix (Test Set):</b></p>'))
         display(cm_df)
-        
     
     # --- TAB 5: SCORE & RANK ---
     try:
@@ -397,8 +410,52 @@ def download_scored(b):
     with output_scoring:
         display(HTML(payload))
 
+def score_new_prospects(b):
+    global predict_df
+    if model_obj is None or feature_names is None:
+        with output_predict:
+            clear_output()
+            print("Train a model first (Run Targeting Model).")
+        return
+    if not predict_upload_widget.value:
+        with output_predict:
+            clear_output()
+            print("Upload a new prospects CSV first.")
+        return
+    
+    key = list(predict_upload_widget.value.keys())[0]
+    content = predict_upload_widget.value[key]['content']
+    predict_df_raw = pd.read_csv(io.BytesIO(content))
+    
+    x_cols = list(x_selector.value)
+    nonmetric_cols = list(nonmetric_selector.value)
+    
+    try:
+        X_new = _prepare_prediction(predict_df_raw, x_cols, nonmetric_cols, feature_names)
+    except Exception as e:
+        with output_predict:
+            clear_output()
+            print(f"Error: {e}")
+        return
+    
+    probs = model_obj.predict_proba(X_new)[:, 1]
+    predict_df = predict_df_raw.copy()
+    predict_df['Likelihood_Score'] = probs
+    predict_df['Rank'] = predict_df['Likelihood_Score'].rank(ascending=False, method='dense').astype(int)
+    
+    with output_predict:
+        clear_output()
+        display(HTML(f'<h4>New Prospects Scored (n={len(predict_df)})</h4>'))
+        display(predict_df[['Rank', 'Likelihood_Score'] + x_cols].head(20).style.format({'Likelihood_Score': '{:.1%}'}))
+        
+        csv = predict_df.to_csv(index=False)
+        b64 = base64.b64encode(csv.encode()).decode()
+        payload = f'<a href="data:text/csv;base64,{b64}" download="new_prospects_scored.csv">Download scored new prospects</a>'
+        display(HTML(payload))
+
 run_button.on_click(run_model)
 download_button.on_click(download_scored)
+score_new_button.on_click(score_new_prospects)
 
 # --- RENDER ---
 display(HTML('<h2>Targeting Dashboard: Find Your Segment in the Wild</h2>'))
