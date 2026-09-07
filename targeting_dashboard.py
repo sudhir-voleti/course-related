@@ -1,6 +1,6 @@
 # ============================================================
 # TARGETING DASHBOARD — Lec05 MKTG
-# Self-contained Colab UI for binary logit targeting
+# sklearn backend — robust to singular matrices
 # ============================================================
 
 import pandas as pd
@@ -9,15 +9,18 @@ import io
 import base64
 from IPython.display import display, HTML, clear_output
 import ipywidgets as widgets
-import statsmodels.api as sm
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
+from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
 # --- GLOBALS ---
 df = None
-model_results = None
+model_obj = None
+feature_names = None
 scored_df = None
 
 # --- WIDGETS ---
@@ -29,7 +32,7 @@ x_selector = widgets.SelectMultiple(description='Predictors (X):', options=[], l
 nonmetric_selector = widgets.SelectMultiple(description='Categorical X (optional):', options=[], layout=widgets.Layout(width='60%', height='100px'))
 
 confirm_vars_button = widgets.Button(description='Confirm Selections', button_style='info', layout=widgets.Layout(width='200px'))
-var_status = widgets.HTML(value='<p style="color:#666;"><i>Upload a CSV first, then select variables here.</i></p>')
+var_status = widgets.HTML(value='<p style="color:#666;"><i>Upload a CSV first.</i></p>')
 
 run_button = widgets.Button(description='Run Targeting Model', button_style='success', layout=widgets.Layout(width='200px'))
 threshold_slider = widgets.FloatSlider(value=0.5, min=0.1, max=0.9, step=0.05, description='Threshold:', readout_format='.0%')
@@ -45,7 +48,7 @@ tabs = widgets.Tab(children=[
     widgets.VBox([widgets.HTML('<h3>Step 1: Upload Data</h3>'), upload_widget, output_upload]),
     widgets.VBox([
         widgets.HTML('<h3>Step 2: Select Variables</h3>'),
-        widgets.HTML('<p>Choose your target segment and predictors. <b>Categorical selection is optional</b> — leave it empty if all your predictors are continuous (numeric).</p>'),
+        widgets.HTML('<p>Choose target and predictors. <b>Categorical selection is optional</b> — leave empty if all Xs are numeric.</p>'),
         y_dropdown, target_value_dropdown, x_selector, nonmetric_selector,
         confirm_vars_button, var_status, output_varselect
     ]),
@@ -83,6 +86,9 @@ def on_upload(change):
             y_dropdown.value = cols[0]
             x_selector.value = tuple(c for c in cols if c != cols[0])
         
+        # KEY FIX: Categorical defaults to NONE selected
+        nonmetric_selector.value = ()
+        
         update_target_value_options(None)
         var_status.value = '<p style="color:green;"><b>Data loaded. Go to "Select Variables" tab.</b></p>'
 
@@ -116,10 +122,9 @@ def confirm_selections(b):
         issues.append("Target cannot also be a predictor.")
     if len(x_cols) == 0:
         issues.append("Select at least one predictor.")
-    # Categorical must be subset of X, but empty is fine
     bad_cats = set(nonmetric_cols) - set(x_cols)
     if len(bad_cats) > 0:
-        issues.append(f"Categorical variables not in predictors: {bad_cats}")
+        issues.append(f"Categoricals not in predictors: {bad_cats}")
     
     with output_varselect:
         clear_output()
@@ -131,83 +136,68 @@ def confirm_selections(b):
             <p style="color:green;"><b>Selections confirmed. Ready to run.</b></p>
             <ul>
             <li><b>Target:</b> {y_col} = "{target_val}" → 1</li>
-            <li><b>Predictors:</b> {len(x_cols)} selected</li>
-            <li><b>Categorical:</b> {', '.join(nonmetric_cols) if nonmetric_cols else '<i>None (all continuous)</i>'}</li>
+            <li><b>Predictors:</b> {len(x_cols)}</li>
+            <li><b>Categorical:</b> {', '.join(nonmetric_cols) if nonmetric_cols else '<i>None</i>'}</li>
             <li><b>Continuous:</b> {', '.join(cont_cols) if cont_cols else '<i>None</i>'}</li>
-            </ul>
-            """
+            </ul>"""
             display(HTML(summary))
             tabs.selected_index = 2
 
 confirm_vars_button.on_click(confirm_selections)
 
-def _make_full_rank(X):
-    """Drop columns until X is full rank. Returns cleaned X."""
-    X = X.astype(float)
-    
-    # Step 1: Drop zero-variance columns
-    for c in list(X.columns):
-        if X[c].std(ddof=0) == 0 or X[c].nunique(dropna=False) <= 1:
-            X = X.drop(columns=[c])
-    
-    # Step 2: Iteratively drop columns causing rank deficiency
-    while True:
-        rank = np.linalg.matrix_rank(X.values)
-        if rank >= X.shape[1]:
-            break  # Full rank achieved
-        # Find which column to drop: use correlation with sum of others as heuristic
-        # Or simply drop the column that, when removed, increases rank most
-        best_col = None
-        best_rank = rank
-        for c in list(X.columns):
-            r = np.linalg.matrix_rank(X.drop(columns=[c]).values)
-            if r > best_rank:
-                best_rank = r
-                best_col = c
-        if best_col is None:
-            # No single column helps; just drop the first one
-            best_col = X.columns[0]
-        X = X.drop(columns=[best_col])
-    
-    # Step 3: Drop near-perfect correlations (r > 0.999)
-    corr_matrix = X.corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [column for column in upper.columns if any(upper[column] > 0.999)]
-    X = X.drop(columns=to_drop, errors='ignore')
-    
-    return X
-
-def _prepare_X(dframe, x_cols, nonmetric_cols):
+def _build_design(dframe, x_cols, nonmetric_cols):
+    """Return design matrix X (no constant) and feature name list."""
     X_parts = []
     cont_cols = [c for c in x_cols if c not in nonmetric_cols]
     
-    # Continuous: force numeric
     if cont_cols:
         X_cont = dframe[cont_cols].copy()
         for c in cont_cols:
             X_cont[c] = pd.to_numeric(X_cont[c], errors='coerce')
         X_parts.append(X_cont)
     
-    # Categorical: one-hot encode
     cat_cols = [c for c in x_cols if c in nonmetric_cols]
     if cat_cols:
         X_cat = pd.get_dummies(dframe[cat_cols], drop_first=True)
-        # Drop any dummy column that is all zeros (happens with train/test splits)
-        for c in list(X_cat.columns):
-            if X_cat[c].sum() == 0:
-                X_cat = X_cat.drop(columns=[c])
         X_parts.append(X_cat)
     
     if not X_parts:
         raise ValueError("No valid predictors.")
     
     X = pd.concat(X_parts, axis=1)
-    X = _make_full_rank(X)
-    X = sm.add_constant(X, has_constant='add')
-    return X
+    return X.astype(float)
+
+def _fit_logit_sklearn(X_train, y_train):
+    """Fit with sklearn — robust to multicollinearity via weak L2 regularization."""
+    # C=1e10 ≈ unregularized, but numerically stable
+    model = LogisticRegression(
+        penalty='l2',
+        C=1e10,
+        solver='lbfgs',
+        max_iter=1000,
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+    return model
+
+def _get_p_values(model, X, y):
+    """Approximate p-values via Wald test using Hessian approximation."""
+    coef = model.coef_[0]
+    proba = model.predict_proba(X)[:, 1]
+    W = np.diag(proba * (1 - proba))
+    # Hessian ≈ X.T @ W @ X + (1/C)*I  (with L2 penalty)
+    hessian = X.T @ W @ X + (1 / 1e10) * np.eye(X.shape[1])
+    try:
+        cov = np.linalg.inv(hessian)
+    except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(hessian)
+    se = np.sqrt(np.diag(cov))
+    z = coef / se
+    p = 2 * (1 - stats.norm.cdf(np.abs(z)))
+    return p, se
 
 def run_model(b):
-    global model_results, scored_df
+    global model_obj, feature_names, scored_df
     
     if df is None:
         with output_results:
@@ -222,7 +212,7 @@ def run_model(b):
     if not x_cols:
         with output_results:
             clear_output()
-            print("Select variables in 'Select Variables' tab first.")
+            print("Select variables first.")
         return
     
     # Build Y
@@ -247,25 +237,14 @@ def run_model(b):
     
     # Build X
     try:
-        X = _prepare_X(dff, x_cols, nonmetric_cols)
+        X = _build_design(dff, x_cols, nonmetric_cols)
     except Exception as e:
         with output_results:
             clear_output()
-            print(f"Error preparing predictors: {e}")
+            print(f"Error: {e}")
         return
     
-    # Warn if any single predictor perfectly predicts Y
-    with output_results:
-        clear_output()
-        for c in X.columns:
-            if c == 'const':
-                continue
-            try:
-                corr = np.corrcoef(X[c].astype(float), y.astype(float))[0,1]
-                if abs(corr) > 0.99:
-                    print(f"⚠️ WARNING: '{c}' almost perfectly predicts target. Model may be unstable.")
-            except:
-                pass
+    feature_names = list(X.columns)
     
     # Train/test split
     try:
@@ -273,26 +252,15 @@ def run_model(b):
     except ValueError:
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # Fit logit
-    try:
-        model = sm.Logit(y_train, X_train)
-        result = model.fit(disp=0, maxiter=200, method='newton')
-    except Exception as e:
-        with output_results:
-            clear_output()
-            err = str(e)
-            if "Singular" in err:
-                print("❌ SINGULAR MATRIX")
-                print("One of your predictors perfectly predicts the target, or two predictors are identical.")
-                print("\nQuick fix: Remove one variable from your predictor list and try again.")
-                print(f"Technical detail: {err}")
-            else:
-                print(f"❌ Model failed: {err}")
-        return
+    # Fit model (sklearn — never crashes on singular matrix)
+    model_obj = _fit_logit_sklearn(X_train, y_train)
     
-    model_results = result
-    y_pred_prob = result.predict(X_test)
-    y_pred = (y_pred_prob >= 0.5).astype(int)
+    # Predictions
+    y_pred_prob = model_obj.predict_proba(X_test)[:, 1]
+    y_pred = model_obj.predict(X_test)
+    
+    # P-values
+    p_values, std_errors = _get_p_values(model_obj, X_train.values, y_train.values)
     
     # --- TAB 3: PREDICTORS ---
     with output_results:
@@ -300,13 +268,13 @@ def run_model(b):
         display(HTML(f'<p><b>Target:</b> {y_col} = "{target_value_dropdown.value}" → 1 | <b>In segment:</b> {y.sum()} | <b>Not in segment:</b> {len(y)-y.sum()}</p>'))
         
         summ = pd.DataFrame({
-            'Variable': result.params.index,
-            'Coefficient': result.params.values,
-            'Std_Error': result.bse.values,
-            'P_Value': result.pvalues.values,
-            'Odds_Ratio': np.exp(result.params.values),
+            'Variable': feature_names,
+            'Coefficient': model_obj.coef_[0],
+            'Std_Error': std_errors,
+            'P_Value': p_values,
+            'Odds_Ratio': np.exp(model_obj.coef_[0]),
             'Significant': ['***' if p < 0.01 else '**' if p < 0.05 else '*' if p < 0.1 else '' 
-                           for p in result.pvalues.values]
+                           for p in p_values]
         })
         display(HTML('<h4>Which observables predict segment membership?</h4>'))
         display(summ.style.format({
@@ -315,7 +283,7 @@ def run_model(b):
         
         sig = summ[summ['P_Value'] < 0.1].copy()
         if len(sig) > 0:
-            sig = sig[sig['Variable'] != 'const'].sort_values('Odds_Ratio', ascending=True)
+            sig = sig.sort_values('Odds_Ratio', ascending=True)
             import matplotlib.pyplot as plt
             fig, ax = plt.subplots(figsize=(8, max(3, len(sig)*0.4)))
             colors = ['green' if c > 0 else 'red' for c in sig['Coefficient']]
@@ -355,14 +323,14 @@ def run_model(b):
     
     # --- TAB 5: SCORE & RANK ---
     try:
-        X_full = _prepare_X(df, x_cols, nonmetric_cols)
+        X_full = _build_design(df, x_cols, nonmetric_cols)
     except Exception as e:
         with output_scoring:
             clear_output()
             print(f"Error: {e}")
         return
     
-    probs = result.predict(X_full)
+    probs = model_obj.predict_proba(X_full)[:, 1]
     scored_df = df.copy()
     scored_df['Likelihood_Score'] = probs
     scored_df['Rank'] = scored_df['Likelihood_Score'].rank(ascending=False, method='dense').astype(int)
