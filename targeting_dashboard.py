@@ -2,7 +2,6 @@
 # TARGETING DASHBOARD — Lec05 MKTG
 # sklearn backend — robust to singular matrices
 # ============================================================
-
 import pandas as pd
 import numpy as np
 import io
@@ -14,9 +13,18 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
 from scipy import stats
+
 import warnings
 warnings.filterwarnings('ignore')
 
+# Sortable tables
+try:
+    from itables import show
+except ImportError:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "itables==2.2.5", "-q"])
+    from itables import show
+    
 # --- GLOBALS ---
 df = None
 model_obj = None
@@ -277,9 +285,12 @@ def run_model(b):
                            for p in p_values]
         })
         display(HTML('<h4>Which observables predict segment membership?</h4>'))
-        display(summ.style.format({
-            'Coefficient': '{:.3f}', 'Std_Error': '{:.3f}', 'P_Value': '{:.4f}', 'Odds_Ratio': '{:.2f}'
-        }).set_properties(**{'text-align': 'left'}))
+        try:
+            show(summ, paging=False, buttons=['copy','csv'], classes="display compact")
+        except Exception:
+            display(summ.style.format({
+                'Coefficient': '{:.3f}', 'Std_Error': '{:.3f}', 'P_Value': '{:.4f}', 'Odds_Ratio': '{:.2f}'
+            }).set_properties(**{'text-align': 'left'}))
         
         sig = summ[summ['P_Value'] < 0.1].copy()
         if len(sig) > 0:
@@ -297,28 +308,33 @@ def run_model(b):
     # --- TAB 4: ACCURACY ---
     with output_accuracy:
         clear_output()
-        display(HTML('<h4>How accurately can we identify target customers?</h4>'))
+        display(HTML('<h4>Model Accuracy</h4>'))
         
-        report = classification_report(y_test, y_pred, output_dict=True, target_names=['Not Target', 'Target'])
-        metrics_df = pd.DataFrame({
-            'Metric': ['Precision', 'Recall', 'F1-Score', 'Support'],
-            'Not Target': [f"{report['Not Target']['precision']:.2f}", f"{report['Not Target']['recall']:.2f}",
-                          f"{report['Not Target']['f1-score']:.2f}", f"{int(report['Not Target']['support'])}"],
-            'Target': [f"{report['Target']['precision']:.2f}", f"{report['Target']['recall']:.2f}",
-                      f"{report['Target']['f1-score']:.2f}", f"{int(report['Target']['support'])}"]
-        })
-        display(metrics_df.style.hide(axis='index'))
+        train_acc = model_obj.score(X_train, y_train) * 100
+        test_acc = model_obj.score(X_test, y_test) * 100
         
-        try:
-            auc = roc_auc_score(y_test, y_pred_prob)
-            display(HTML(f'<p><b>AUC:</b> {auc:.2f} <small>(0.5=random, 0.8=good, 0.9=excellent)</small></p>'))
-        except:
-            pass
+        display(HTML(f"""
+        <table style="width:55%; border-collapse:collapse; margin:12px 0; font-size:1.05em;">
+          <tr style="background:#f2f2f2;">
+            <th style="border:1px solid #ccc; padding:10px; text-align:left;">Dataset</th>
+            <th style="border:1px solid #ccc; padding:10px; text-align:center;">Accuracy</th>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding:10px;">Training (model learned from this)</td>
+            <td style="border:1px solid #ccc; padding:10px; text-align:center; font-weight:bold; color:#003366;">{train_acc:.1f}%</td>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding:10px;">Test (held-out, never seen before)</td>
+            <td style="border:1px solid #ccc; padding:10px; text-align:center; font-weight:bold; color:#003366;">{test_acc:.1f}%</td>
+          </tr>
+        </table>
+        <p style="color:#666; font-size:0.9em;"><i>Test accuracy is the number that matters for targeting new customers.</i></p>
+        """))
         
         cm = confusion_matrix(y_test, y_pred)
         cm_df = pd.DataFrame(cm, index=['Actually Not Target', 'Actually Target'],
                              columns=['Predicted Not Target', 'Predicted Target'])
-        display(HTML('<p><b>Confusion Matrix:</b></p>'))
+        display(HTML('<p><b>Confusion Matrix (Test Set):</b></p>'))
         display(cm_df)
     
     # --- TAB 5: SCORE & RANK ---
