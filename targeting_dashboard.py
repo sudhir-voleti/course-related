@@ -1,5 +1,5 @@
 # ============================================================
-# TARGETING DASHBOARD — Lec05 MKTG
+# TARGETING DASHBOARD — Lec05 MKTG core
 # Self-contained Colab UI for binary logit targeting
 # ============================================================
 
@@ -23,7 +23,6 @@ scored_df = None
 # --- WIDGETS ---
 upload_widget = widgets.FileUpload(accept='.csv', multiple=False, description='Upload CSV')
 
-# Variable selection widgets
 y_dropdown = widgets.Dropdown(description='Target (Y):', options=[], layout=widgets.Layout(width='60%'))
 target_value_dropdown = widgets.Dropdown(description='Target Value = 1:', options=[], layout=widgets.Layout(width='60%'))
 x_selector = widgets.SelectMultiple(description='Predictors (X):', options=[], layout=widgets.Layout(width='60%', height='150px'))
@@ -75,7 +74,6 @@ def on_upload(change):
         print(f"Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
         display(df.head())
         
-        # Populate all selectors
         cols = list(df.columns)
         y_dropdown.options = cols
         x_selector.options = cols
@@ -113,13 +111,12 @@ def confirm_selections(b):
     nonmetric_cols = list(nonmetric_selector.value)
     target_val = target_value_dropdown.value
     
-    # Validation
     issues = []
     if y_col in x_cols:
         issues.append("Target cannot also be a predictor.")
     if len(x_cols) == 0:
         issues.append("Select at least one predictor.")
-    if len(set(x_cols) & set(nonmetric_cols)) != len(nonmetric_cols):
+    if len(set(nonmetric_cols) - set(x_cols)) > 0:
         issues.append("Categorical selections must be a subset of predictors.")
     
     with output_varselect:
@@ -139,7 +136,7 @@ def confirm_selections(b):
             <p><i>Click "Run Targeting Model" in the Predictors tab.</i></p>
             """
             display(HTML(summary))
-            tabs.selected_index = 2  # Auto-switch to Predictors tab
+            tabs.selected_index = 2
 
 confirm_vars_button.on_click(confirm_selections)
 
@@ -151,18 +148,46 @@ def _prepare_X(dframe, x_cols, nonmetric_cols):
         X_cont = dframe[cont_cols].copy()
         for c in cont_cols:
             X_cont[c] = pd.to_numeric(X_cont[c], errors='coerce')
-        X_parts.append(X_cont)
+        # Drop zero-variance continuous columns
+        for c in list(X_cont.columns):
+            if X_cont[c].nunique(dropna=False) <= 1:
+                X_cont = X_cont.drop(columns=[c])
+        if not X_cont.empty:
+            X_parts.append(X_cont)
     
     cat_cols = [c for c in x_cols if c in nonmetric_cols]
     if cat_cols:
         X_cat = pd.get_dummies(dframe[cat_cols], drop_first=True)
-        X_parts.append(X_cat)
+        # Drop zero-variance dummy columns
+        for c in list(X_cat.columns):
+            if X_cat[c].sum() == 0 or X_cat[c].nunique(dropna=False) <= 1:
+                X_cat = X_cat.drop(columns=[c])
+        if not X_cat.empty:
+            X_parts.append(X_cat)
     
     if not X_parts:
-        raise ValueError("No valid predictor columns.")
+        raise ValueError("No valid predictor columns after cleaning.")
     
     X = pd.concat(X_parts, axis=1)
     X = X.astype(float)
+    
+    # Drop columns that are perfectly collinear with others
+    # Use correlation matrix to find near-perfect correlations
+    corr_matrix = X.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > 0.999)]
+    if to_drop:
+        X = X.drop(columns=to_drop)
+    
+    # Add constant only if matrix is not already singular
+    if np.linalg.matrix_rank(X.values) < X.shape[1]:
+        # Try dropping one column to resolve rank deficiency
+        for c in list(X.columns):
+            X_test = X.drop(columns=[c])
+            if np.linalg.matrix_rank(X_test.values) == X_test.shape[1]:
+                X = X_test
+                break
+    
     X = sm.add_constant(X, has_constant='add')
     return X
 
@@ -199,6 +224,15 @@ def run_model(b):
                 pass
         y = (dff[y_col] == target_val).astype(int)
     
+    # Check for complete separation (any X perfectly predicts Y)
+    with output_results:
+        clear_output()
+        for c in x_cols:
+            if dff[c].dtype != 'object' and dff[c].nunique() > 1:
+                corr = np.corrcoef(dff[c].astype(float), y)[0,1]
+                if abs(corr) > 0.99:
+                    print(f"WARNING: '{c}' almost perfectly predicts target. Consider removing it.")
+    
     # Prep X
     try:
         X = _prepare_X(dff, x_cols, nonmetric_cols)
@@ -227,7 +261,18 @@ def run_model(b):
     except Exception as e:
         with output_results:
             clear_output()
-            print(f"Model failed: {e}")
+            err_msg = str(e)
+            if "Singular matrix" in err_msg:
+                print("SINGULAR MATRIX ERROR:")
+                print("This usually means one of your predictors perfectly predicts the target (complete separation),")
+                print("or two predictors are perfectly correlated.")
+                print("\nQuick fixes:")
+                print("1. Remove one of the categorical variables that might perfectly split the target.")
+                print("2. Check if any two predictors are identical (e.g., 'Age' and 'Age_years').")
+                print("3. If using all dummy variables from one-hot encoding, ensure 'drop_first=True' is active (it is).")
+                print(f"\nOriginal error: {err_msg}")
+            else:
+                print(f"Model failed: {err_msg}")
         return
     
     model_results = result
