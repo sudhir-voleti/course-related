@@ -187,22 +187,31 @@ def _fit_logit_sklearn(X_train, y_train):
     model.fit(X_train, y_train)
     return model
 
-def _get_p_values(model, X, y):
-    """Approximate p-values via Wald test using Hessian approximation."""
-    coef = model.coef_[0]
-    proba = model.predict_proba(X)[:, 1]
-    W = np.diag(proba * (1 - proba))
-    # Hessian ≈ X.T @ W @ X + (1/C)*I  (with L2 penalty)
-    hessian = X.T @ W @ X + (1 / 1e10) * np.eye(X.shape[1])
-    try:
-        cov = np.linalg.inv(hessian)
-    except np.linalg.LinAlgError:
-        cov = np.linalg.pinv(hessian)
-    se = np.sqrt(np.diag(cov))
-    z = coef / se
-    p = 2 * (1 - stats.norm.cdf(np.abs(z)))
-    return p, se
-
+def _bootstrap_pvalues(model, X, y, n_boot=100):
+    """Bootstrap p-values: check if coefficient is stable across resamples."""
+    coef_samples = []
+    rng = np.random.RandomState(42)
+    for i in range(n_boot):
+        idx = rng.choice(len(y), size=len(y), replace=True)
+        Xb = X.iloc[idx] if hasattr(X, 'iloc') else X[idx]
+        yb = y.iloc[idx] if hasattr(y, 'iloc') else y[idx]
+        try:
+            m = LogisticRegression(penalty='l2', C=model.C, solver='lbfgs', max_iter=300, random_state=i)
+            m.fit(Xb, yb)
+            coef_samples.append(m.coef_[0])
+        except:
+            pass
+    if len(coef_samples) < 50:
+        return np.ones(X.shape[1]) * 0.999, np.ones(X.shape[1]) * 0.0
+    coef_samples = np.array(coef_samples)
+    main_coef = model.coef_[0]
+    pvals = []
+    for j in range(len(main_coef)):
+        opposite = np.mean((coef_samples[:, j] * main_coef[j]) < 0)
+        p = max(2 * min(opposite, 1 - opposite), 0.001) if opposite > 0 else 0.001
+        pvals.append(p)
+    return np.array(pvals), np.std(coef_samples, axis=0)
+    
 def run_model(b):
     global model_obj, feature_names, scored_df
     
@@ -266,8 +275,8 @@ def run_model(b):
     y_pred_prob = model_obj.predict_proba(X_test)[:, 1]
     y_pred = model_obj.predict(X_test)
     
-    # P-values
-    p_values, std_errors = _get_p_values(model_obj, X_train.values, y_train.values)
+    # P-values via bootstrap (robust to separation)
+    p_values, std_errors = _bootstrap_pvalues(model_obj, X_train, y_train)
     
     # --- TAB 3: PREDICTORS ---
     with output_results:
@@ -303,14 +312,26 @@ def run_model(b):
             ax.set_title('Strongest Predictors')
             plt.tight_layout()
             plt.show()
-    
-    # --- TAB 4: ACCURACY ---
+
+        # --- TAB 4: ACCURACY ---
     with output_accuracy:
         clear_output()
         display(HTML('<h4>Model Accuracy</h4>'))
         
         train_acc = model_obj.score(X_train, y_train) * 100
         test_acc = model_obj.score(X_test, y_test) * 100
+        
+        # Separation warning
+        if train_acc > 95:
+            display(HTML("""
+            <div style="background:#fff3cd; border:1px solid #ffc107; padding:12px; border-radius:6px; margin-bottom:12px;">
+                <b>⚠️ Warning: Near-perfect accuracy detected.</b><br>
+                One or more predictors may almost perfectly predict the target segment 
+                (e.g., "Occupation = Student" perfectly identifies "Not Busy Professional"). 
+                This is not a "good" model — it is a tautology. Remove the strongest predictor 
+                and re-run to find meaningful patterns.
+            </div>
+            """))
         
         display(HTML(f"""
         <table style="width:55%; border-collapse:collapse; margin:12px 0; font-size:1.05em;">
@@ -335,6 +356,7 @@ def run_model(b):
                              columns=['Predicted Not Target', 'Predicted Target'])
         display(HTML('<p><b>Confusion Matrix (Test Set):</b></p>'))
         display(cm_df)
+        
     
     # --- TAB 5: SCORE & RANK ---
     try:
