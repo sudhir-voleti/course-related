@@ -1,16 +1,20 @@
 # logimatch_03_evidence_gather.py
-# Cell 4: Tool 2 & Tool 3 — Single-Site Tool Demo (Tab 1) + Roster Evidence Fetch & Fallback Recovery (Tab 2)
+# Cell 4: Tool 2 & Tool 3 — Single-Site Tool Demo (Tab 1) + Roster Evidence Fetch & Multi-Tier Fallback Recovery (Tab 2)
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.google.com/",
+}
 
 def fetch_site_text(url: str) -> str:
     """Tool 2: Scrapes clean operational text directly from an accessible website."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        )
-    }
     try:
-        resp = requests.get(str(url).strip(), headers=headers, timeout=10, allow_redirects=True)
+        resp = requests.get(str(url).strip(), headers=BROWSER_HEADERS, timeout=10, allow_redirects=True)
         if resp.status_code != 200:
             return ""
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -24,16 +28,43 @@ def fetch_site_text(url: str) -> str:
     except Exception:
         return ""
 
-def search_web_fallback(company_name: str, city: str = "") -> str:
-    """Tool 3: Fallback DuckDuckGo search when direct site fetch is blocked or empty."""
-    query = f"{company_name} {city} products manufacturing services".strip()
+def _wiki_company_lookup(company_name: str) -> str:
+    """Zero-rate-limit backup via Wikipedia Search API for established firms."""
     try:
-        results = list(DDGS().text(query, max_results=3))
-        if not results:
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "search", "srsearch": company_name, "format": "json", "srlimit": 2},
+            headers={"User-Agent": "LogiMatchAcademicWorkshop/1.0"},
+            timeout=8,
+        )
+        hits = r.json().get("query", {}).get("search", [])
+        if not hits:
             return ""
-        return " | ".join([f"{r.get('title', '')}: {r.get('body', '')}" for r in results])[:2000]
+        snippets = [BeautifulSoup(h.get("snippet", ""), "html.parser").get_text(" ", strip=True) for h in hits]
+        title = hits[0].get("title", "")
+        if any(tok.lower() in title.lower() for tok in company_name.split()[:2]):
+            return f"Wikipedia ({title}): " + " | ".join(snippets)
+        return ""
     except Exception:
         return ""
+
+def search_web_fallback(company_name: str, city: str = "") -> str:
+    """Tool 3: Fallback DuckDuckGo search (with anti-throttle pacing) + Wikipedia backup."""
+    queries = [
+        f"{company_name} {city} products manufacturing".strip(),
+        f"{company_name} India company profile",
+    ]
+    for q in queries:
+        try:
+            time.sleep(1.5)  # Prevent shared Colab IP rate-limiting
+            results = list(DDGS().text(q, max_results=3))
+            if results:
+                return " | ".join([f"{r.get('title', '')}: {r.get('body', '')}" for r in results])[:2000]
+        except Exception:
+            time.sleep(2.0)
+            continue
+
+    return _wiki_company_lookup(company_name)
 
 if "pipeline_df" in globals() and pipeline_df is not None:
     accessible_firms = list(pipeline_df.loc[pipeline_df["Access_Status"] == "ACCESSIBLE", "Firm_Name"])
@@ -125,11 +156,11 @@ def on_gather_all(_):
 
         fb = search_web_fallback(firm)
         if fb:
-            sources.append("Web Search Fallback (ddgs)")
+            sources.append("Web Search / Directory Fallback")
             statuses.append("EVIDENCE_READY")
             evidences.append(fb)
         else:
-            sources.append("None (Both Failed)")
+            sources.append("None (All Fallbacks Failed)")
             statuses.append("DEAD_LEAD_HOLD")
             evidences.append("")
 
