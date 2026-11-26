@@ -1,5 +1,5 @@
 # logimatch_05_outreach_composer.py
-# Cell 6: Grounded Outreach Composer, Live Audit Table & CSV/JSON Export
+# Cell 6: Grounded Outreach Composer, Transparent Prompt Inspector & CSV/JSON Export
 
 from google.colab import files as colab_files
 
@@ -10,6 +10,24 @@ class OutreachDraft(BaseModel):
     email_body: str = Field(
         description="3-sentence consultative outreach email referencing verified evidence and pitching ONLY the matched catalog item(s)."
     )
+
+def _build_outreach_prompt(firm_name: str, matched_items: str, evidence: str, reasoning: str) -> str:
+    return f"""You are a Senior B2B Solutions Consultant.
+Write a crisp 3-sentence outreach email to '{firm_name}' pitching ONLY the approved offering(s) below.
+
+RULES:
+1. Reference 1–2 concrete operational facts from the Verified Evidence (never invent claims).
+2. Connect those facts directly to the Approved Catalog Match and Reasoning.
+3. Keep the tone consultative, peer-to-peer, and concise (3 sentences max, no fluff).
+
+=== APPROVED CATALOG MATCH ===
+{matched_items}
+
+=== MATCH REASONING ===
+{reasoning}
+
+=== VERIFIED EVIDENCE ===
+{evidence[:2200] if evidence else "[NO EVIDENCE — ROW LOCKED]"}"""
 
 def _single_email_call(client, prompt: str) -> dict:
     last_err = ""
@@ -32,25 +50,7 @@ def _single_email_call(client, prompt: str) -> dict:
             return {"subject_line": "API_ERROR", "email_body": f"API Error: {last_err[:90]}"}
     return {"subject_line": "API_BUSY", "email_body": f"Model busy ({last_err[:80]})"}
 
-def _draft_email_hard_20s(client, firm_name: str, matched_items: str, evidence: str, reasoning: str) -> dict:
-    prompt = f"""
-You are a Senior B2B Solutions Consultant.
-Write a crisp 3-sentence outreach email to '{firm_name}' pitching ONLY the approved offering(s) below.
-
-RULES:
-1. Reference 1–2 concrete operational facts from the Verified Evidence (never invent claims).
-2. Connect those facts directly to the Approved Catalog Match and Reasoning.
-3. Keep the tone consultative, peer-to-peer, and concise (3 sentences max, no fluff).
-
-=== APPROVED CATALOG MATCH ===
-{matched_items}
-
-=== MATCH REASONING ===
-{reasoning}
-
-=== VERIFIED EVIDENCE ===
-{evidence[:2200]}
-"""
+def _draft_email_hard_20s(client, prompt: str) -> dict:
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(_single_email_call, client, prompt)
     try:
@@ -92,10 +92,49 @@ lbl_c6_status = widgets.HTML(
 
 out_c6_table = widgets.Output()
 out_c6_reader = widgets.Output()
+out_c6_prompt = widgets.Output()
 
-tabs_c6 = widgets.Tab(children=[out_c6_table, out_c6_reader])
+tabs_c6 = widgets.Tab(children=[out_c6_table, out_c6_reader, out_c6_prompt])
 tabs_c6.set_title(0, "1. Live Outreach Status Table")
 tabs_c6.set_title(1, "2. Email Pitch Reader")
+tabs_c6.set_title(2, "3. Inspect AI Brain Prompt")
+
+def _render_prompt_inspector_c6():
+    with out_c6_prompt:
+        clear_output()
+        if "pipeline_df" not in globals() or pipeline_df is None or "Matched_Items" not in pipeline_df.columns:
+            display(HTML("<i>Run Cell 5 first to preview the outreach composer prompt.</i>"))
+            return
+
+        dd_p_firm = widgets.Dropdown(
+            options=list(pipeline_df["Firm_Name"]),
+            description="Preview Lead:",
+            style={"description_width": "100px"},
+            layout=widgets.Layout(width="360px"),
+        )
+        prompt_box = widgets.HTML()
+
+        def _update_prompt_view(change=None):
+            row = pipeline_df[pipeline_df["Firm_Name"] == dd_p_firm.value].iloc[0]
+            if row["Review_Gate"] != "READY_TO_PITCH":
+                rendered = f"[GUARDRAIL LOCKED — Review_Gate = {row['Review_Gate']}]\nNo prompt sent to Gemini. Row automatically quarantined as 'HELD — DO NOT SEND'."
+            else:
+                rendered = _build_outreach_prompt(
+                    dd_p_firm.value,
+                    row["Matched_Items"],
+                    row["Extracted_Evidence"],
+                    row["Reasoning"],
+                )
+            escaped = rendered.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            prompt_box.value = f"""
+            <div style='margin-top:8px;'>
+                <p><b>Exact Backend Prompt Sent to Gemini (JSON Schema Enforced: <code>OutreachDraft</code>):</b></p>
+                <pre style='background:#0f172a; color:#f8fafc; padding:12px; border-radius:6px; max-height:320px; overflow-y:auto; white-space:pre-wrap; font-size:0.86em;'>{escaped}</pre>
+            </div>"""
+
+        dd_p_firm.observe(_update_prompt_view, names="value")
+        _update_prompt_view()
+        display(widgets.VBox([dd_p_firm, prompt_box]))
 
 def _render_email_reader():
     with out_c6_reader:
@@ -149,7 +188,8 @@ def on_draft_all_clicked(_):
             body = "HELD FOR MANUAL REVIEW — Automated outreach locked until human reviewer clears this lead."
         else:
             lbl_c6_status.value = f"<i>⏳ Drafting pitch ({idx + 1}/{total}): <b>{firm}</b> (20s hard cap)...</i>"
-            res = _draft_email_hard_20s(client, firm, row["Matched_Items"], row["Extracted_Evidence"], row["Reasoning"])
+            prompt = _build_outreach_prompt(firm, row["Matched_Items"], row["Extracted_Evidence"], row["Reasoning"])
+            res = _draft_email_hard_20s(client, prompt)
             subj = res.get("subject_line", "")
             body = res.get("email_body", "")
             time.sleep(0.5)
@@ -157,52 +197,3 @@ def on_draft_all_clicked(_):
         subjects.append(subj)
         bodies.append(body)
         live_preview.append({
-            "Firm_Name": firm,
-            "Review_Gate": gate,
-            "Matched_Items": row["Matched_Items"],
-            "Email_Subject": subj,
-            "Email_Preview": (body[:95] + "...") if len(body) > 95 else body,
-        })
-
-        with out_c6_table:
-            clear_output(wait=True)
-            display(HTML(pd.DataFrame(live_preview).to_html(index=False)))
-
-    pipeline_df["Email_Subject"] = subjects
-    pipeline_df["Email_Body"] = bodies
-
-    export_cols = [
-        "Firm_Name",
-        "Website_URL",
-        "Access_Status",
-        "Evidence_Source",
-        "Matched_Items",
-        "Rejected_Items",
-        "Review_Gate",
-        "Reasoning",
-        "Email_Subject",
-        "Email_Body",
-    ]
-    final_df = pipeline_df[export_cols]
-    final_df.to_csv("logimatch_final_output.csv", index=False)
-    final_df.to_json("logimatch_final_output.json", orient="records", indent=2, force_ascii=False)
-
-    n_sent = (pipeline_df["Review_Gate"] == "READY_TO_PITCH").sum()
-    lbl_c6_status.value = (
-        f"<span style='color:#15803d;'><b>✅ Complete! Drafted {n_sent} grounded pitches "
-        f"({total - n_sent} held safely). Export files ready.</b></span>"
-    )
-    btn_draft_all.disabled = False
-    btn_dl_csv.disabled = False
-    btn_dl_json.disabled = False
-    _render_email_reader()
-
-btn_draft_all.on_click(on_draft_all_clicked)
-btn_dl_csv.on_click(lambda _: colab_files.download("logimatch_final_output.csv"))
-btn_dl_json.on_click(lambda _: colab_files.download("logimatch_final_output.json"))
-
-display(widgets.VBox([
-    widgets.HBox([api_key_c6, btn_draft_all, btn_dl_csv, btn_dl_json]),
-    lbl_c6_status,
-    tabs_c6,
-]))
