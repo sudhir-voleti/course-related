@@ -19,7 +19,6 @@ def fetch_site_text(url: str) -> str:
         blocks = [el.get_text(" ", strip=True) for el in soup.find_all(["h1", "h2", "h3", "p", "li"])]
         cleaned = " | ".join([b for b in blocks if len(b.split()) >= 4])
         if len(cleaned) < 80:
-            # Fallback for div/span-heavy modern layouts (e.g., raghuvamsi.com)
             cleaned = " ".join(soup.get_text(" ", strip=True).split())
         return cleaned[:3000] if len(cleaned) >= 80 else ""
     except Exception:
@@ -36,7 +35,6 @@ def search_web_fallback(company_name: str, city: str = "") -> str:
     except Exception:
         return ""
 
-# --- Tab 1: Single-Site Tool Demo (Inspect what the AI Brain actually receives) ---
 if "pipeline_df" in globals() and pipeline_df is not None:
     accessible_firms = list(pipeline_df.loc[pipeline_df["Access_Status"] == "ACCESSIBLE", "Firm_Name"])
     all_firms = list(pipeline_df["Firm_Name"])
@@ -60,7 +58,6 @@ out_demo_tool = widgets.HTML(
     value="<i>Select an accessible lead and click <b>Test Tools on Selected Lead</b> to inspect the exact text extracted for the AI brain.</i>"
 )
 
-# --- Tab 2: Batch Roster Fetch + Fallback Recovery ---
 btn_gather_all = widgets.Button(
     description="Gather Evidence for All Leads",
     button_style="primary",
@@ -101,11 +98,61 @@ def on_demo_tool(_):
             <div style='background:#f8fafc; border:1px solid #e2e8f0; padding:10px; max-height:200px; overflow-y:auto; font-size:0.9em;'>{txt}</div>
         </div>"""
     else:
-        out_demo_tool.value = (
-            f"<span style='color:#b45309;'><b>⚠️ Both tools returned empty for {firm} (DEAD_LEAD_HOLD).</b></span>"
-        )
+        out_demo_tool.value = f"<span style='color:#b45309;'><b>⚠️ Both tools returned empty for {firm} (DEAD_LEAD_HOLD).</b></span>"
 
 def on_gather_all(_):
     global pipeline_df
     if "pipeline_df" not in globals() or pipeline_df is None:
-        lbl_gather_status
+        lbl_gather_status.value = "<span style='color:#b91c1c;'><b>⚠️ Run Cell 3 first.</b></span>"
+        return
+
+    btn_gather_all.disabled = True
+    sources, statuses, evidences = [], [], []
+    total = len(pipeline_df)
+
+    for idx, row in pipeline_df.iterrows():
+        firm = row["Firm_Name"]
+        url = row["Website_URL"]
+        lbl_gather_status.value = f"<i>⏳ Gathering ({idx + 1}/{total}): <b>{firm}</b>...</i>"
+
+        if row["Access_Status"] == "ACCESSIBLE":
+            ev = fetch_site_text(url)
+            if ev:
+                sources.append("Direct Website Scrape")
+                statuses.append("EVIDENCE_READY")
+                evidences.append(ev)
+                continue
+
+        fb = search_web_fallback(firm)
+        if fb:
+            sources.append("Web Search Fallback (ddgs)")
+            statuses.append("EVIDENCE_READY")
+            evidences.append(fb)
+        else:
+            sources.append("None (Both Failed)")
+            statuses.append("DEAD_LEAD_HOLD")
+            evidences.append("")
+
+    pipeline_df["Evidence_Source"] = sources
+    pipeline_df["Evidence_Status"] = statuses
+    pipeline_df["Extracted_Evidence"] = evidences
+
+    n_ready = (pipeline_df["Evidence_Status"] == "EVIDENCE_READY").sum()
+    lbl_gather_status.value = (
+        f"<span style='color:#15803d;'><b>✅ Evidence Gathered: {n_ready}/{total} leads ready for AI matching; "
+        f"{total - n_ready} held as dead/unverified leads.</b></span>"
+    )
+    btn_gather_all.disabled = False
+
+    preview_df = pipeline_df[["Firm_Name", "Access_Status", "Evidence_Source", "Evidence_Status"]].copy()
+    preview_df["Evidence_Snippet"] = pipeline_df["Extracted_Evidence"].apply(
+        lambda x: (x[:110] + "...") if len(x) > 110 else (x or "—")
+    )
+
+    with out_gather_table:
+        clear_output()
+        display(HTML(preview_df.to_html(index=False)))
+
+btn_demo_tool.on_click(on_demo_tool)
+btn_gather_all.on_click(on_gather_all)
+display(tabs_c4)
