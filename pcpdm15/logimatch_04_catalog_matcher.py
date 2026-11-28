@@ -191,4 +191,152 @@ def _render_gatekeeper_tab():
 
         row_widgets = []
         for idx, r in pipeline_df.iterrows():
-            firm = str(
+            firm = str(r["Firm_Name"])
+            current_gate = str(r.get("Review_Gate", "HUMAN_REVIEW_NEEDED"))
+            options = ["READY_TO_PITCH", "HUMAN_REVIEW_NEEDED", "DEAD_LEAD_HOLD"]
+            if current_gate not in options:
+                options.append(current_gate)
+
+            dd_gate = widgets.Dropdown(
+                options=options,
+                value=current_gate,
+                layout=widgets.Layout(width="220px"),
+            )
+            lbl_info = widgets.HTML(
+                value=f"<b>{firm}</b> — <span style='color:#475569; font-size:0.9em;'>{str(r.get('Reasoning', ''))[:140]}</span>",
+                layout=widgets.Layout(width="520px"),
+            )
+
+            def _make_handler(row_idx):
+                def _on_gate_change(change):
+                    if change["name"] == "value":
+                        pipeline_df.at[row_idx, "Review_Gate"] = change["new"]
+                        _render_verdict_tab()
+                return _on_gate_change
+
+            dd_gate.observe(_make_handler(idx), names="value")
+            row_widgets.append(widgets.HBox([dd_gate, lbl_info], layout=widgets.Layout(margin="4px 0")))
+
+        display(widgets.VBox(row_widgets))
+
+
+def _render_prompt_inspector_c5():
+    with out_prompt_c5_tab:
+        clear_output()
+        if (
+            "pipeline_df" not in globals()
+            or pipeline_df is None
+            or "catalog_df" not in globals()
+            or catalog_df is None
+            or "col_map" not in globals()
+        ):
+            display(HTML("<i>Upload data in Cell 2 and gather evidence in Cell 4 to preview rendered prompts.</i>"))
+            return
+
+        cat_text = _format_generic_catalog(catalog_df, col_map)
+        dd_p_firm = widgets.Dropdown(
+            options=list(pipeline_df["Firm_Name"]),
+            description="Preview Lead:",
+            style={"description_width": "100px"},
+            layout=widgets.Layout(width="360px"),
+        )
+        prompt_box = widgets.HTML()
+
+        def _update_prompt_view(change=None):
+            row = pipeline_df[pipeline_df["Firm_Name"] == dd_p_firm.value].iloc[0]
+            ev = str(row["Extracted_Evidence"]) if "Extracted_Evidence" in pipeline_df.columns and pd.notna(row["Extracted_Evidence"]) else ""
+            rendered = _build_matcher_prompt(dd_p_firm.value, ev, cat_text)
+            escaped = rendered.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            prompt_box.value = f"""
+            <div style='margin-top:8px;'>
+                <p><b>Exact Backend Prompt Sent to Gemini (JSON Schema Enforced: <code>SegmentVerdict</code>):</b></p>
+                <pre style='background:#0f172a; color:#f8fafc; padding:12px; border-radius:6px; max-height:320px; overflow-y:auto; white-space:pre-wrap; font-size:0.86em;'>{escaped}</pre>
+            </div>"""
+
+        dd_p_firm.observe(_update_prompt_view, names="value")
+        _update_prompt_view()
+        display(widgets.VBox([dd_p_firm, prompt_box]))
+
+
+def _on_run_match_clicked(_):
+    global pipeline_df
+    if (
+        "pipeline_df" not in globals()
+        or pipeline_df is None
+        or "catalog_df" not in globals()
+        or catalog_df is None
+        or "col_map" not in globals()
+    ):
+        lbl_match_status.value = "<span style='color:#b91c1c;'><b>Missing upstream data:</b> Please run Cell 2 (Data Intake) and Cell 4 (Evidence Gather) first.</span>"
+        return
+
+    key = api_key_c5.value.strip()
+    if not key:
+        lbl_match_status.value = "<span style='color:#b91c1c;'><b>API Key required:</b> Paste your personal Gemini API key into the input box above.</span>"
+        return
+
+    btn_run_match.disabled = True
+    tabs_c5.selected_index = 0
+
+    for col in ["Extracted_Operations", "Matched_Items", "Rejected_Items", "Review_Gate", "Reasoning"]:
+        if col not in pipeline_df.columns:
+            pipeline_df[col] = ""
+
+    client = genai.Client(api_key=key)
+    cat_text = _format_generic_catalog(catalog_df, col_map)
+    total = len(pipeline_df)
+
+    try:
+        for i, (idx, row) in enumerate(pipeline_df.iterrows(), start=1):
+            firm = str(row["Firm_Name"])
+            ev_status = str(row.get("Evidence_Status", ""))
+            evidence = str(row.get("Extracted_Evidence", "")) if pd.notna(row.get("Extracted_Evidence")) else ""
+
+            if "DEAD_LEAD_HOLD" in ev_status or len(evidence.strip()) < 30:
+                pipeline_df.at[idx, "Extracted_Operations"] = "None (Insufficient web evidence)"
+                pipeline_df.at[idx, "Matched_Items"] = "HOLD — No verified match"
+                pipeline_df.at[idx, "Rejected_Items"] = "All SKUs held pending verifiable company evidence"
+                pipeline_df.at[idx, "Review_Gate"] = "DEAD_LEAD_HOLD"
+                pipeline_df.at[idx, "Reasoning"] = "Quarantined prior to LLM scoring because neither direct scrape nor search fallback returned verifiable operations."
+                _render_verdict_tab()
+                continue
+
+            lbl_match_status.value = f"<i>Scoring row {i}/{total}: <b>{firm}</b>...</i>"
+            prompt = _build_matcher_prompt(firm, evidence, cat_text)
+            verdict = _score_lead_hard_20s(client, prompt)
+
+            if "error" in verdict:
+                pipeline_df.at[idx, "Extracted_Operations"] = "Error"
+                pipeline_df.at[idx, "Matched_Items"] = "ERROR — Manual check"
+                pipeline_df.at[idx, "Rejected_Items"] = "-"
+                pipeline_df.at[idx, "Review_Gate"] = "HUMAN_REVIEW_NEEDED"
+                pipeline_df.at[idx, "Reasoning"] = verdict["error"]
+            else:
+                pipeline_df.at[idx, "Extracted_Operations"] = "; ".join(verdict.get("extracted_operations", []))
+                pipeline_df.at[idx, "Matched_Items"] = "; ".join(verdict.get("matched_items", []))
+                pipeline_df.at[idx, "Rejected_Items"] = "; ".join(verdict.get("rejected_items", []))
+                pipeline_df.at[idx, "Review_Gate"] = verdict.get("review_gate", "HUMAN_REVIEW_NEEDED")
+                pipeline_df.at[idx, "Reasoning"] = verdict.get("reasoning", "")
+
+            _render_verdict_tab()
+
+        lbl_match_status.value = "<span style='color:#15803d;'><b>Done!</b> All prospects scored. Inspect Tab 2 to approve/override any gate before Stage 5.</span>"
+        _render_gatekeeper_tab()
+        _render_prompt_inspector_c5()
+    finally:
+        btn_run_match.disabled = False
+
+
+btn_run_match.on_click(_on_run_match_clicked)
+
+display(
+    widgets.VBox([
+        widgets.HBox([api_key_c5, btn_run_match]),
+        lbl_match_status,
+        tabs_c5,
+    ])
+)
+
+_render_verdict_tab()
+_render_gatekeeper_tab()
+_render_prompt_inspector_c5()
